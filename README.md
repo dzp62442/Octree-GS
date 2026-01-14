@@ -43,15 +43,14 @@ We tested on a server configured with Ubuntu 18.04, cuda 11.6 and gcc 9.4.0. Oth
 
 1. Clone this repo:
 
-```
+```shell
 git clone https://github.com/city-super/Octree-GS --recursive
 cd Octree-GS
 ```
 
 2. Install dependencies
 
-```
-SET DISTUTILS_USE_SDK=1 # Windows only
+```shell
 conda env create --file environment.yml
 conda activate octree_gs
 ```
@@ -60,7 +59,7 @@ conda activate octree_gs
 
 First, create a ```data/``` folder inside the project path by 
 
-```
+```shell
 mkdir data
 ```
 
@@ -113,7 +112,7 @@ To train multiple scenes in parallel, we provide batch training scripts:
 
  run them with 
 
- ```
+ ```shell
 bash train_xxx.sh
  ```
 
@@ -125,7 +124,7 @@ bash train_xxx.sh
 
 For training a single scene, modify the path and configurations in ```single_train.sh``` accordingly and run it:
 
-```
+```shell
 bash single_train.sh
 ```
 
@@ -164,7 +163,7 @@ which may differ somewhat from the original 3D-GS, but it does not affect the an
 
 Meanwhile, we keep the manual rendering function with a similar usage of the counterpart in [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting), one can run it by 
 
-```
+```shell
 python render.py -m <path to trained model> # Generate renderings
 python metrics.py -m <path to trained model> # Compute error metrics on renderings
 ```
