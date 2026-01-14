@@ -211,6 +211,7 @@ def readCamerasFromTransforms(path, transformsfile, random_background, white_bac
             fovx = contents["camera_angle_x"]
         except:
             fovx = None
+        no_flip_yz = contents.get("no_flip_yz", False)
 
         frames = contents["frames"]
         # check if filename already contain postfix
@@ -240,7 +241,8 @@ def readCamerasFromTransforms(path, transformsfile, random_background, white_bac
             
             ct += 1
             # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
-            c2w[:3, 1:3] *= -1
+            if not no_flip_yz:
+                c2w[:3, 1:3] *= -1
 
             # get the world-to-camera transform and set R, T
             w2c = np.linalg.inv(c2w)
