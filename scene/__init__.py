@@ -50,7 +50,9 @@ class Scene:
         else:
             scene_info = sceneLoadTypeCallbacks["City"](args.source_path, args.random_background, args.white_background, args.eval, args.ds, undistorted=args.undistorted)
 
-        self.gaussians.set_appearance(len(scene_info.train_cameras))
+        num_train = len(scene_info.train_cameras)
+        num_test = len(scene_info.test_cameras)
+        self.gaussians.set_appearance(max(num_train, num_test))
         
         if not self.loaded_iter:
             points = self.save_ply(scene_info.point_cloud, args.ratio, os.path.join(self.model_path, "input.ply"))

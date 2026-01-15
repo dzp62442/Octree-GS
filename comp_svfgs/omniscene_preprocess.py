@@ -102,10 +102,11 @@ def preprocess_scene(
     scene_data: dict,
     output_root: str,
     conf_threshold: float = 0.3,
+    prefix: str = "01",
 ) -> str:
     """将单个 bin 预处理为 Octree-GS 可加载的场景结构。"""
     bin_token = scene_data["scene"]
-    scene_name = f"01_{bin_token}"
+    scene_name = f"{prefix}_{bin_token}"
     scene_dir = os.path.join(output_root, scene_name)
     images_dir = os.path.join(scene_dir, "images")
 
@@ -167,6 +168,7 @@ def preprocess_scene(
     # 元信息
     meta = {
         "scene": bin_token,
+        "prefix": prefix,
         "resolution": [int(context["image"].shape[2]), int(context["image"].shape[3])],
         "context_views": len(train_frames),
         "target_views": len(test_frames),

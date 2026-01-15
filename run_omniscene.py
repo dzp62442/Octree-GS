@@ -72,12 +72,15 @@ def main():
     dataset = OmniSceneDataset(data_root=args.data_root, stage=args.stage, reso=reso)
 
     iterations_arg = ["--iterations", str(args.iterations)]
+    prefix_width = max(2, len(str(len(dataset))))
     for idx in range(len(dataset)):
         scene_data = dataset[idx]
+        prefix = str(idx + 1).zfill(prefix_width)
         scene_dir = preprocess_scene(
             scene_data=scene_data,
             output_root=output_root,
             conf_threshold=args.conf_threshold,
+            prefix=prefix,
         )
         _run_train(
             scene_dir=scene_dir,
