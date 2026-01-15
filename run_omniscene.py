@@ -50,7 +50,7 @@ def _run_train(scene_dir: str, output_root: str, gpu: str, extra_args: list):
 
 def main():
     parser = argparse.ArgumentParser(description="OmniScene 单阶段预处理+训练+评估")
-    parser.add_argument("--data_root", required=True, default="data/omniscene", help="OmniScene 数据根目录")
+    parser.add_argument("--data_root", default="data/omniscene", help="OmniScene 数据根目录")
     parser.add_argument("--output_root", default="output/omniscene", help="预处理输出根目录")
     parser.add_argument("--result_root", default="output/omniscene_results", help="训练输出根目录")
     parser.add_argument("--stage", default="val", choices=["train", "val", "test", "demo"], help="数据划分")
@@ -58,6 +58,7 @@ def main():
     parser.add_argument("--conf_threshold", type=float, default=0.3, help="点云置信度阈值")
     parser.add_argument("--gpu", default=None, help="指定 GPU id，默认使用最空闲 GPU")
     parser.add_argument("--extra_train_args", nargs=argparse.REMAINDER, default=[], help="透传给 train.py 的额外参数")
+    parser.add_argument("--iterations", type=int, default=10000, help="训练迭代次数，默认 10000")
 
     args = parser.parse_args()
     reso = _parse_reso(args.reso)
@@ -70,6 +71,7 @@ def main():
 
     dataset = OmniSceneDataset(data_root=args.data_root, stage=args.stage, reso=reso)
 
+    iterations_arg = ["--iterations", str(args.iterations)]
     for idx in range(len(dataset)):
         scene_data = dataset[idx]
         scene_dir = preprocess_scene(
@@ -81,7 +83,7 @@ def main():
             scene_dir=scene_dir,
             output_root=result_root,
             gpu=args.gpu,
-            extra_args=args.extra_train_args,
+            extra_args=iterations_arg + args.extra_train_args,
         )
 
 
