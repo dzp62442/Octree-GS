@@ -37,6 +37,8 @@ def _run_train(scene_dir: str, output_root: str, gpu: str, extra_args: list):
         model_path,
         "-r",
         "1",
+        "--appearance_dim",
+        "0",
     ]
     if gpu is not None:
         cmd += ["--gpu", gpu]
