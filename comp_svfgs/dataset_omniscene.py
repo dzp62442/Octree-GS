@@ -3,6 +3,7 @@ import os.path as osp
 import json
 import pickle as pkl
 import copy
+import re
 from typing import List, Tuple, Optional
 
 import numpy as np
@@ -12,6 +13,9 @@ from PIL import Image
 # OmniScene 相关常量
 DATA_VERSION = "interp_12Hz_trainval"
 DATASET_PREFIX = "/datasets/nuScenes"
+CENTER150_FILENAME = "bins_center150_v1.json"
+CENTER150_SAMPLE_COUNT = 150
+CENTER150_TOKEN_PATTERN = re.compile(r"^scene([0-9a-f]+)_bin(\d+)$")
 CAMERA_TYPES = [
     "CAM_FRONT",
     "CAM_FRONT_RIGHT",
@@ -35,6 +39,47 @@ bins_dynamic_demo = [
     "scene7e2d9f38f8eb409ea57b3864bb4ed098_bin150",
     "scene50ff554b3ecb4d208849d042b7643715_bin000",
 ]
+
+
+def _load_center150_tokens(data_root: str) -> List[str]:
+    """只读取并校验由 SVF-GS 生成的 Center150 清单。"""
+    split_path = osp.join(data_root, DATA_VERSION, CENTER150_FILENAME)
+    if not osp.isfile(split_path):
+        raise FileNotFoundError(
+            "Center150 清单不存在：{}。请先在 SVF-GS 主项目中生成该文件。".format(split_path)
+        )
+
+    with open(split_path, "r", encoding="utf-8") as split_file:
+        split_data = json.load(split_file)
+    tokens = split_data.get("bins")
+    if not isinstance(tokens, list):
+        raise ValueError("Center150 清单必须包含列表字段 'bins'：{}".format(split_path))
+    if len(tokens) != CENTER150_SAMPLE_COUNT or len(set(tokens)) != CENTER150_SAMPLE_COUNT:
+        raise ValueError(
+            "Center150 清单必须包含 {} 个唯一 bin，实际为 {} 条、{} 条唯一记录。".format(
+                CENTER150_SAMPLE_COUNT, len(tokens), len(set(tokens))
+            )
+        )
+
+    scene_tokens = []
+    for token in tokens:
+        if not isinstance(token, str):
+            raise ValueError("Center150 清单中存在非字符串 bin token：{}".format(token))
+        match = CENTER150_TOKEN_PATTERN.fullmatch(token)
+        if match is None:
+            raise ValueError("Center150 bin token 格式错误：{}".format(token))
+        scene_tokens.append(match.group(1))
+        info_path = osp.join(data_root, DATA_VERSION, "bin_infos_3.2m", token + ".pkl")
+        if not osp.isfile(info_path):
+            raise FileNotFoundError("Center150 bin 信息不存在：{}".format(info_path))
+
+    if len(set(scene_tokens)) != CENTER150_SAMPLE_COUNT:
+        raise ValueError(
+            "Center150 清单必须覆盖 {} 个不同场景，实际为 {} 个。".format(
+                CENTER150_SAMPLE_COUNT, len(set(scene_tokens))
+            )
+        )
+    return tokens
 
 
 def _hwc3(img: np.ndarray) -> np.ndarray:
@@ -153,6 +198,8 @@ class OmniSceneDataset:
                 open(osp.join(self.data_root, DATA_VERSION, "bins_val_3.2m.json"))
             )["bins"]
             self.bin_tokens = self.bin_tokens[:30000:3000][:10]
+        elif stage == "center150":
+            self.bin_tokens = _load_center150_tokens(self.data_root)
         elif stage == "test":
             self.bin_tokens = json.load(
                 open(osp.join(self.data_root, DATA_VERSION, "bins_val_3.2m.json"))

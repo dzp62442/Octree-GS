@@ -9,6 +9,9 @@ from PIL import Image
 from scene.dataset_readers import storePly
 
 
+PREPARED_FORMAT_VERSION = 2
+
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -45,6 +48,52 @@ def _save_transforms(frames: List[Dict], out_path: str) -> None:
     }
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def prepared_scene_complete(
+    scene_dir: str,
+    bin_token: str,
+    resolution: Tuple[int, int],
+    conf_threshold: float,
+) -> bool:
+    """校验预处理缓存是否与当前样本及参数完全一致。"""
+    images_dir = os.path.join(scene_dir, "images")
+    required_paths = [
+        os.path.join(scene_dir, "transforms_train.json"),
+        os.path.join(scene_dir, "transforms_test.json"),
+        os.path.join(scene_dir, "points3D.ply"),
+        os.path.join(scene_dir, "meta.json"),
+    ]
+    if not os.path.isdir(images_dir) or any(not os.path.isfile(path) for path in required_paths):
+        return False
+    if any(os.path.getsize(path) == 0 for path in required_paths):
+        return False
+
+    try:
+        with open(os.path.join(scene_dir, "meta.json"), "r", encoding="utf-8") as meta_file:
+            meta = json.load(meta_file)
+        if meta.get("format_version") != PREPARED_FORMAT_VERSION:
+            return False
+        if meta.get("scene") != bin_token:
+            return False
+        if meta.get("resolution") != [int(resolution[0]), int(resolution[1])]:
+            return False
+        if abs(float(meta.get("conf_threshold")) - float(conf_threshold)) > 1e-12:
+            return False
+
+        with open(required_paths[0], "r", encoding="utf-8") as train_file:
+            train_frames = json.load(train_file).get("frames", [])
+        with open(required_paths[1], "r", encoding="utf-8") as test_file:
+            test_frames = json.load(test_file).get("frames", [])
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+    if len(train_frames) != 6 or len(test_frames) != 18:
+        return False
+    image_paths = [frame.get("file_path") for frame in train_frames + test_frames]
+    if any(not isinstance(path, str) for path in image_paths):
+        return False
+    return all(os.path.isfile(os.path.join(scene_dir, path)) for path in image_paths)
 
 
 def _build_point_cloud(
@@ -116,15 +165,11 @@ def preprocess_scene(
 
     context = scene_data["context"]
     target = scene_data["target"]
-    expected_train = context["image"].shape[0]
-    expected_test = target["image"].shape[0]
 
-    if os.path.exists(transforms_train) and os.path.exists(transforms_test) and os.path.exists(ply_path):
-        if os.path.isdir(images_dir):
-            train_imgs = [f for f in os.listdir(images_dir) if f.startswith("train_")]
-            test_imgs = [f for f in os.listdir(images_dir) if f.startswith("test_")]
-            if len(train_imgs) >= expected_train and len(test_imgs) >= expected_test:
-                return scene_dir
+    if prepared_scene_complete(
+        scene_dir, bin_token, (int(context["image"].shape[2]), int(context["image"].shape[3])), conf_threshold
+    ):
+        return scene_dir
 
     _ensure_dir(images_dir)
 
@@ -167,9 +212,11 @@ def preprocess_scene(
 
     # 元信息
     meta = {
+        "format_version": PREPARED_FORMAT_VERSION,
         "scene": bin_token,
         "prefix": prefix,
         "resolution": [int(context["image"].shape[2]), int(context["image"].shape[3])],
+        "conf_threshold": float(conf_threshold),
         "context_views": len(train_frames),
         "target_views": len(test_frames),
         "train_images": train_names,

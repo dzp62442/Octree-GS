@@ -1,126 +1,138 @@
-# OmniScene 数据集实验文档（Octree-GS / comp_svfgs 分支）
+# OmniScene 数据集实验文档（Octree-GS / comp_svfgs）
 
-## 1. 背景与目标
-- 当前分支为 `comp_svfgs`，目标是在本项目（逐场景优化的高斯重建）上复现 OmniScene（魔改 nuScenes）实验，用于与自研前馈方法对比。
-- 参考项目：
-  - `depthsplat`：前馈式高斯重建，已有 OmniScene 配置、加载与调用实现。
-  - `SVF-GS`：完整支持 OmniScene 的前馈项目，包含绝对深度与置信度加载逻辑，可用于生成初始化点云。
+## 1. 实验边界
 
-## 2. Octree-GS 数据加载的约束
-- 本项目支持三类数据入口：
-  1) **Colmap**：`sparse/0` + `points3D.(bin/txt/ply)`。
-  2) **Blender/NeRF 风格**：存在 `transforms_train.json` 时走该分支，可读取 `transforms_train.json`/`transforms_test.json`。
-  3) **City**：自定义 JSON + PLY/LAS。
-- 对于 **Colmap/City**，点云是必须的；对 **Blender**，若缺少 PLY 会随机初始化点云。
-- 结论：**OmniScene 必须在预处理阶段生成点云（PLY），禁止随机初始化。若点云生成失败则直接报错退出。**
+本分支把原本面向 Mip-NeRF 360 等数据集的逐场景优化流程接入 OmniScene，用于和 SVF-GS 等前馈方法进行同数据、同视角、同优化预算对比。
 
-## 3. 数据预处理规划（输出到 output）
-### 3.1 目录结构
-- 在项目根目录创建 `output/`，统一存放预处理结果与训练输出。
-- 每个 bin 作为一个“场景”，命名规则：`01_<bin_token>`。
-- 预处理场景目录建议结构如下：
-```
-output/omniscene/
-├── 01_<bin_token>/
-│   ├── images/                 # 6 张输入 + 18 张输出
-│   ├── transforms_train.json   # 6 张输入视角
-│   ├── transforms_test.json    # 18 张输出视角
-│   ├── points3D.ply            # 由绝对深度生成的初始化点云
-│   └── meta.json               # 记录分辨率、bin_token、相机列表等
+Center150 的样本划分由 `~/Projects/SVF-GS` 唯一负责生成。本项目：
+
+- 只读取 `interp_12Hz_trainval/bins_center150_v1.json`；
+- 不包含 Center150 生成、重排或修改逻辑；
+- 加载前检查清单包含 150 个唯一 bin、覆盖 150 个不同场景、token 格式合法，并确认对应 `bin_infos_3.2m/*.pkl` 存在；
+- 保持清单中的原始顺序，场景名前缀固定为 `001` 至 `150`。
+
+## 2. 默认 Center150 协议
+
+项目根目录直接执行：
+
+```bash
+python run_omniscene.py
 ```
 
-### 3.2 预处理步骤
-1) 读取 OmniScene 的 bin 信息（默认 `val` 模式前 10 个 bin）。
-2) 对每个 bin：
-   - 选取 **6 张输入视角**（固定 key-frame）。
-   - 选取 **18 张输出视角**（每个相机取 index `[1,2]`，共 12 张，再拼入 6 张输入）。
-   - 统一 resize 到目标分辨率（默认 `112x200`，可选 `224x400`）。
-   - 写入 `images/` 与 `transforms_train.json` / `transforms_test.json`。
-3) 生成初始化点云（详见第 5 节），必须成功生成 PLY。
-4) 保存 `meta.json`（方便排查与复现实验）。
-5) 若场景目录已存在且完整，则跳过预处理。
+默认配置为：
 
-## 4. comp_svfgs 数据加载模块设计
-### 4.1 新增文件
-- `comp_svfgs/dataset_omniscene.py`：参考 `depthsplat/src/dataset/dataset_omniscene.py`。
+- 数据划分：`center150`；
+- 分辨率：`112x200`；
+- 每个 bin 使用 6 张输入图像优化高斯；
+- 在 18 张目标图像上评估，其中前 12 张为新视角，最后 6 张为输入视角；
+- 总优化次数：10000；
+- 评估里程碑：1000、5000、10000；
+- GPU：0；
+- appearance embedding：关闭（`--appearance_dim 0`）；
+- 初始化点云：由 6 个输入视角的 Metric3D 绝对深度和置信度构造，阈值为 0.3。
 
-### 4.2 核心功能
-- **加载 context / target**：仅保留 RGB + 相机内外参（不加载动态掩码/相对深度）。
-- **支持模式**：`train / val / test / demo`，默认 `val`。
-- **val 模式**：固定 10 个 bin，每个 bin 视为一个场景，适配逐场景优化方式。
-- **load_conditions**：保持 `depthsplat` 版本的路径替换与 resize 逻辑（包括 `samples_small` / `sweeps_small` 和内参缩放方式），确保与 OmniScene 数据目录一致。
+本机只有一张卡，因此默认命令已经使用 GPU 0；如需显式指定，仍可执行：
 
-## 5. 初始化点云生成（绝对尺度深度）
-### 5.1 参考实现
-- 参考 `SVF-GS`：
-  - `data/dataloader.py`
-  - `data/transforms/loading.py`
-- 使用 **Metric3D 深度**与**置信度**：
-  - 深度路径：`samples_dptm_small` / `sweeps_dptm_small`
-  - 置信度路径：`*_conf.npy`
-
-### 5.2 处理流程
-1) 读取输入视角的绝对深度与置信度，resize 到目标分辨率。
-2) 置信度过滤：`conf > 0.3` 视为有效。
-3) 通过内参将深度反投影到相机坐标系，再用 `c2w` 转到世界坐标系。
-4) 合并 6 张输入视角点云，必要时按体素/采样率下采样。
-5) 保存为 `points3D.ply`（用于 Octree-GS 初始化）。
-
-### 5.3 坐标系注意事项
-- OmniScene 在本项目中 **不需要 flip_yz**，与 `depthsplat` 的处理一致。
-- 若沿用 `readCamerasFromTransforms`（其内部会做 `c2w[:3,1:3] *= -1`），需要在自定义 loader 中显式禁用该翻转，或改为使用自定义相机读取逻辑，确保 **全流程不做 flip_yz**。
-- 仍建议用少量场景渲染做坐标一致性校验，避免方向错误导致重建退化。
-
-## 6. 主流程整合（单阶段完成）
-### 6.1 新增运行脚本
-- 在项目根目录新增 `run_omniscene.py`（或同级脚本）。
-- 该脚本完成：
-  1) **预处理**（若未完成则生成）
-  2) **训练**（逐场景优化）
-  3) **渲染与评估**（调用 `train.py` 内置流程）
-
-### 6.2 执行逻辑（伪流程）
-```
-for bin in val_bins:
-  scene_dir = output/omniscene/01_<bin>
-  if not preprocessed(scene_dir):
-    preprocess(scene_dir)
-  run_train(scene_dir, eval=True)
+```bash
+python run_omniscene.py --gpu 0
 ```
 
-### 6.3 与现有 train.py 的对接要点
-- `train.py` 自带训练+渲染+评估流程：
-  - `--eval` 为 `True` 时会渲染 test set 并计算指标。
-- 每个场景独立产出 `output/omniscene_results/<scene_name>/<exp>/<time>/`。
+## 3. 参数覆写
 
-## 7. 参数约定
-- **分辨率**：默认 `112x200`，可选 `224x400`。
-- **-r 参数**：固定为 `1`（因为已经在预处理阶段手动 resize）。
-- **输入视角**：固定 6 张（训练用）。
-- **输出视角**：固定 18 张（评估用）。
-- **迭代次数**：沿用默认值（后续可配置）。
+顶层协议参数直接在启动器中覆写：
 
-## 8. 与 depthsplat 的关键差异
-1) **训练范式**：
-   - depthsplat：前馈式训练，batch 为多个 bin。
-   - Octree-GS：逐场景优化，每个 bin 单独训练、渲染与评估。
-2) **数据组织**：
-   - depthsplat：直接读取原始 OmniScene 目录。
-   - Octree-GS：需先预处理成 `transforms_train/test + points3D.ply` 形式。
-3) **点云初始化**：
-   - depthsplat：不需要点云。
-   - Octree-GS：必须使用绝对深度生成点云，不允许随机点云。
-4) **评估方式**：
-   - depthsplat：由模型前向输出。
-   - Octree-GS：由 `render.py`/`train.py` 渲染 test 视角并计算 PSNR/SSIM/LPIPS。
+```bash
+python run_omniscene.py \
+  --gpu 0 \
+  --reso 224x400 \
+  --iterations 12000 \
+  --eval_iterations 1000 5000 10000 12000
+```
 
-## 9. 待确认事项
-- OmniScene 数据中 `Metric3D` 绝对深度与置信度文件是否完整存在。
-- 坐标系一致性是否通过小场景验证（强调“不翻转”前提下的正确性）。
-- 是否需要在评估阶段导出额外指标（如 PCC）。
+Octree-GS 自身的模型或优化参数放在 `--extra_train_args` 之后：
 
-## 10. 下一步实现清单（审阅通过后执行）
-- 新建 `comp_svfgs/` 与 `output/` 目录。
-- 实现 `comp_svfgs/dataset_omniscene.py` 与预处理逻辑。
-- 新增 `run_omniscene.py` 并串联预处理 + 训练 + 渲染评估。
-- 小规模 sanity check（1~2 个 bin）后再批量运行。
+```bash
+python run_omniscene.py --gpu 0 \
+  --extra_train_args --base_layer 4 --visible_threshold 0.01
+```
+
+数据路径、模型路径、总迭代数和评估/保存里程碑由启动器统一管理，不能放入 `--extra_train_args`，避免产物协议与实际命令不一致。Center150 启动器明确不启用 checkpoint，`--checkpoint_iterations` 与 `--start_checkpoint` 同样不能透传。使用不同额外参数进行独立实验时，应通过 `--result_root` 指定不同结果根目录。
+
+如需复现旧的 10-bin val 实验，可执行：
+
+```bash
+python run_omniscene.py --stage val --gpu 0
+```
+
+## 4. 数据与坐标约定
+
+预处理输出采用 Octree-GS 已支持的 NeRF/Blender 风格目录：
+
+```text
+output/omniscene/center150_112x200/
+└── 001_<bin_token>/
+    ├── images/
+    ├── transforms_train.json
+    ├── transforms_test.json
+    ├── points3D.ply
+    └── meta.json
+```
+
+每个 frame 分别保存自己的 `fl_x/fl_y/cx/cy`，因此本项目对 OmniScene 使用逐图像内参，而不是把一个全局内参强行共享给所有视角。
+
+OmniScene 的 `sensor2lidar_transform` 在本适配中作为 OpenCV 相机坐标系下的 c2w 使用。`transforms_*.json` 写入 `no_flip_yz=true`，Octree-GS reader 不再执行 Blender/OpenGL 的 Y/Z 轴翻转；初始化点云也用同一 c2w 直接把 OpenCV 相机点变换到世界坐标系。该链路与 SVF-GS/DropGaussian 对照校验后保持不变。
+
+预处理缓存会检查版本、bin token、分辨率、置信度阈值、6/18 视角数量、图像、transform 和 PLY；不匹配时重新预处理。
+
+## 5. 里程碑评估与计时
+
+在每个指定里程碑，`train.py` 会：
+
+1. 用当前高斯在全部 18 个 test 视角渲染；
+2. 计算并落盘 PSNR、SSIM、LPIPS；
+3. 记录从第 1 次迭代累计到当前里程碑的训练耗时；
+4. 仅在最终迭代（默认 10k）保存 PLY。
+
+训练耗时通过 CUDA 同步后的 wall time 统计，并排除里程碑评估、渲染图像写盘和最终 PLY 保存耗时。每个样本在单次进程中从 0 训练到 10k，因此 1k/5k/10k 均为从第 1 次迭代开始的累计训练时间。Center150 不保存任何样本内 checkpoint。
+
+单个样本的核心产物为：
+
+```text
+<model_path>/
+├── metrics_1000.txt
+├── metrics_5000.txt
+├── metrics_10000.txt
+├── training_time_1000.txt
+├── training_time_5000.txt
+├── training_time_10000.txt
+├── point_cloud/iteration_10000/point_cloud.ply
+├── test/ours_{1000,5000,10000}/{renders,gt}/
+└── center150_complete.json
+```
+
+## 6. 断点续跑与快速跳过
+
+Center150 使用固定模型目录，不使用时间戳。命令可以安全重复执行：
+
+- 完整样本必须同时具备三个里程碑的有限指标、非负且单调的累计训练时间、各 18 张 render/GT，以及最终 10k PLY；完整后直接跳过，不再读取该样本的 RGB/深度；
+- 不完整样本不做样本内续跑。启动器会删除该样本的未完成结果目录，再从 0 训练到 10k，避免新旧里程碑产物混合；预处理缓存不会被删除；
+- Center150 不生成 `chkpnt*.pth`，断点粒度就是完整样本；
+- 实验根目录保存 `center150_protocol.json`。同一目录若检测到分辨率、迭代里程碑、置信度阈值或额外训练参数发生变化，会拒绝混用结果。
+
+## 7. 自动汇总
+
+只有 150 个样本全部通过完整性检查后，启动器才生成：
+
+```text
+output/omniscene_results/center150_112x200/
+├── center150_metrics_summary.json
+└── center150_metrics_summary.txt
+```
+
+汇总文件包含：
+
+- 每个样本在 1k/5k/10k 的 PSNR、SSIM、LPIPS 和累计训练耗时；
+- 150 个样本在每个里程碑的平均 PSNR、SSIM、LPIPS 和平均累计训练耗时；
+- 分辨率、总迭代数、评估里程碑和生成时间。
+
+如果任一样本失败或产物不完整，流程会报错退出而不会生成一个看似完整的 150 样本平均值；修复问题后重复同一命令即可续跑。

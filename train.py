@@ -13,9 +13,10 @@ import os
 import numpy as np
 
 import subprocess
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+    cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
+    result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
+    os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
 
 os.system('echo $CUDA_VISIBLE_DEVICES')
 
@@ -44,7 +45,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
 # torch.set_num_threads(32)
-lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
+lpips_fn = lpips.LPIPS(net='vgg').to('cuda').eval()
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -77,7 +78,7 @@ def saveRuntimeCode(dst: str) -> None:
     print('Backup Finished!')
 
 
-def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
+def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None, full_eval_metrics=False):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(
@@ -99,6 +100,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    training_timer_start = time.perf_counter()
+    excluded_training_overhead = 0.0
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in octree-gs yet
         if network_gui.conn == None:
@@ -169,10 +172,35 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            is_full_evaluation = full_eval_metrics and iteration in testing_iterations
+            training_time_seconds = None
+            evaluation_overhead_start = None
+            if is_full_evaluation:
+                torch.cuda.synchronize()
+                evaluation_overhead_start = time.perf_counter()
+                training_time_seconds = (
+                    evaluation_overhead_start
+                    - training_timer_start
+                    - excluded_training_overhead
+                )
+            training_report(
+                tb_writer, dataset_name, iteration, Ll1, loss, l1_loss,
+                iter_start.elapsed_time(iter_end), testing_iterations, scene, render,
+                (pipe, background), wandb, logger, full_eval_metrics, training_time_seconds
+            )
+            if is_full_evaluation:
+                torch.cuda.synchronize()
+                excluded_training_overhead += time.perf_counter() - evaluation_overhead_start
             if (iteration in saving_iterations):
+                save_overhead_start = None
+                if full_eval_metrics:
+                    torch.cuda.synchronize()
+                    save_overhead_start = time.perf_counter()
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if full_eval_metrics:
+                    torch.cuda.synchronize()
+                    excluded_training_overhead += time.perf_counter() - save_overhead_start
             
             # densification
             if iteration < opt.update_until and iteration > opt.start_stat:
@@ -227,7 +255,23 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
+def write_evaluation_metrics(model_path, iteration, psnr_value, ssim_value, lpips_value, training_time_seconds):
+    metrics_path = os.path.join(model_path, "metrics_{}.txt".format(iteration))
+    temporary_metrics_path = metrics_path + ".tmp"
+    with open(temporary_metrics_path, "w") as metrics_file:
+        metrics_file.write("PSNR : {:>12.7f}\n".format(psnr_value))
+        metrics_file.write("SSIM : {:>12.7f}\n".format(ssim_value))
+        metrics_file.write("LPIPS : {:>12.7f}\n".format(lpips_value))
+    os.replace(temporary_metrics_path, metrics_path)
+
+    timing_path = os.path.join(model_path, "training_time_{}.txt".format(iteration))
+    temporary_timing_path = timing_path + ".tmp"
+    with open(temporary_timing_path, "w") as timing_file:
+        timing_file.write("TRAINING_TIME_SECONDS : {:.7f}\n".format(training_time_seconds))
+    os.replace(temporary_timing_path, timing_path)
+
+
+def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None, full_eval_metrics=False, training_time_seconds=None):
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
@@ -239,6 +283,8 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
     
     # Report test and samples of training set
     if iteration in testing_iterations:
+        cpu_rng_state = torch.get_rng_state() if full_eval_metrics else None
+        cuda_rng_state = torch.cuda.get_rng_state() if full_eval_metrics else None
         scene.gaussians.eval()
         torch.cuda.empty_cache()
         
@@ -249,6 +295,14 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                is_full_test_eval = full_eval_metrics and config['name'] == 'test'
+                ssim_test = 0.0
+                lpips_test = 0.0
+                if is_full_test_eval:
+                    render_path = os.path.join(scene.model_path, config['name'], "ours_{}".format(iteration), "renders")
+                    gt_path = os.path.join(scene.model_path, config['name'], "ours_{}".format(iteration), "gt")
+                    os.makedirs(render_path, exist_ok=True)
+                    os.makedirs(gt_path, exist_ok=True)
                 
                 if wandb is not None:
                     gt_image_list = []
@@ -275,12 +329,31 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
 
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    if is_full_test_eval:
+                        ssim_test += ssim(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+                        lpips_test += lpips_fn(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+                        torchvision.utils.save_image(image, os.path.join(render_path, viewpoint.image_name + ".png"))
+                        torchvision.utils.save_image(gt_image, os.path.join(gt_path, viewpoint.image_name + ".png"))
 
                 
                 
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
-                logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                if is_full_test_eval:
+                    ssim_test /= len(config['cameras'])
+                    lpips_test /= len(config['cameras'])
+                    write_evaluation_metrics(
+                        scene.model_path, iteration, psnr_test.item(), ssim_test.item(),
+                        lpips_test.item(), training_time_seconds
+                    )
+                    logger.info(
+                        "\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {} TRAIN_TIME {}s".format(
+                            iteration, config['name'], l1_test, psnr_test, ssim_test,
+                            lpips_test, training_time_seconds
+                        )
+                    )
+                else:
+                    logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
 
                 
                 if tb_writer:
@@ -288,6 +361,12 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                     tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
                 if wandb is not None:
                     wandb.log({f"{config['name']}_loss_viewpoint_l1_loss":l1_test, f"{config['name']}_PSNR":psnr_test})
+                    if is_full_test_eval:
+                        wandb.log({
+                            f"{config['name']}_SSIM": ssim_test,
+                            f"{config['name']}_LPIPS": lpips_test,
+                            f"{config['name']}_training_time_seconds": training_time_seconds,
+                        })
 
         if tb_writer:
             # tb_writer.add_histogram(f'{dataset_name}/'+"scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
@@ -295,6 +374,9 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
         torch.cuda.empty_cache()
 
         scene.gaussians.train()
+        if full_eval_metrics:
+            torch.set_rng_state(cpu_rng_state)
+            torch.cuda.set_rng_state(cuda_rng_state)
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -497,6 +579,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--full_eval_metrics", action="store_true", help="在测试迭代保存完整指标、渲染结果与纯训练耗时")
     parser.add_argument("--gpu", type=str, default = '-1')
     args = parser.parse_args(sys.argv[1:])
 
@@ -556,25 +639,37 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
     # training
-    training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb, logger)
+    training(
+        lp.extract(args), op.extract(args), pp.extract(args), dataset, args.test_iterations,
+        args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
+        wandb, logger, full_eval_metrics=args.full_eval_metrics
+    )
     if args.warmup:
         logger.info("\n Warmup finished! Reboot from last checkpoints")
         new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args.iterations}', 'point_cloud.ply')
-        training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger, ply_path=new_ply_path)
+        training(
+            lp.extract(args), op.extract(args), pp.extract(args), dataset, args.test_iterations,
+            args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
+            wandb=wandb, logger=logger, ply_path=new_ply_path,
+            full_eval_metrics=args.full_eval_metrics
+        )
 
     # All done
     logger.info("\nTraining complete.")
 
     # rendering
-    logger.info(f'\nStarting Rendering~')
-    if args.eval:
-        visible_count = render_sets(lp.extract(args), -1, pp.extract(args), skip_train=True, skip_test=False, wandb=wandb, logger=logger)
+    if args.full_eval_metrics:
+        logger.info("\nMilestone rendering and evaluation completed during training.")
     else:
-        visible_count = render_sets(lp.extract(args), -1, pp.extract(args), skip_train=False, skip_test=True, wandb=wandb, logger=logger)
-    logger.info("\nRendering complete.")
+        logger.info(f'\nStarting Rendering~')
+        if args.eval:
+            visible_count = render_sets(lp.extract(args), -1, pp.extract(args), skip_train=True, skip_test=False, wandb=wandb, logger=logger)
+        else:
+            visible_count = render_sets(lp.extract(args), -1, pp.extract(args), skip_train=False, skip_test=True, wandb=wandb, logger=logger)
+        logger.info("\nRendering complete.")
 
-    # calc metrics
-    logger.info("\n Starting evaluation...")
-    eval_name = 'test' if args.eval else 'train'
-    evaluate(args.model_path, eval_name, visible_count=visible_count, wandb=wandb, logger=logger)
-    logger.info("\nEvaluating complete.")
+        # calc metrics
+        logger.info("\n Starting evaluation...")
+        eval_name = 'test' if args.eval else 'train'
+        evaluate(args.model_path, eval_name, visible_count=visible_count, wandb=wandb, logger=logger)
+        logger.info("\nEvaluating complete.")
